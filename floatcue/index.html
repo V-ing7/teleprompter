@@ -2725,18 +2725,19 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       // 48kHz mono AAC-LC 静音帧：每帧 1024 samples = 21.333ms
       // （iOS Safari PiP 强制要求视频含音频轨道，静音帧即可）
       var AAC_SILENCE_FRAME = new Uint8Array([0x01, 0x18, 0x20, 0x07]);
-      var AAC_FRAME_SEC = 1024 / 48000; // 0.0213333s — muxer 期望秒
-      var aacNextSec = 0;
+      // mp4-muxer 的时间戳/时长单位是【微秒】(内部 timestamp/1e6)
+      var AAC_FRAME_US = 21333; // 1024/48000 s ≈ 21333us
+      var aacNextUs = 0;
 
       var encodeError = null;
-      // 用自己维护的帧序号出时间戳：WebCodecs 会给首帧加微小舍入偏移（如 -4e-8s），
-      // 直接透传 chunk.timestamp 会让 muxer 报 "first chunk must have timestamp of 0"。
+      // 用自维护帧序号出时间戳（微秒）：WebCodecs 首帧会带 -0.04us 级浮点偏移，
+      // 直接透传 chunk.timestamp 会触发 muxer 的 "first chunk must be 0" 校验。
       var outIndex = 0;
-      var vFrameSec = 1 / FPS;
+      var vFrameUs = Math.round(1e6 / FPS);
       encoder = new VideoEncoder({
         output: function(chunk, meta){
           try {
-            muxer.addVideoChunk(chunk, meta, outIndex * vFrameSec, vFrameSec);
+            muxer.addVideoChunk(chunk, meta, outIndex * vFrameUs);
             outIndex++;
           } catch(e){ encodeError = encodeError || e; }
         },
@@ -2749,17 +2750,16 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
         if (encodeError) throw encodeError;
         var tSec = i / FPS;
         var tUs = Math.round(tSec * 1e6);
-        // 交错塞静音 AAC 帧，时间戳用秒（muxer 期望）
-        while (aacNextSec < tSec){
-          muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextSec, AAC_FRAME_SEC);
-          aacNextSec += AAC_FRAME_SEC;
+        // 交错塞静音 AAC 帧（时间戳单位：微秒，与视频轨一致）
+        while (aacNextUs < tUs){
+          muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextUs, AAC_FRAME_US);
+          aacNextUs += AAC_FRAME_US;
         }
         drawAt(tSec < HOLD ? 0 : Math.min(span, (tSec - HOLD) * state.speed));
 
-        var frameDurUs = Math.round(1e6 / FPS);
         var frame = new VideoFrame(els.canvas, {
           timestamp: tUs,
-          duration: frameDurUs
+          duration: vFrameUs
         });
         encoder.encode(frame, { keyFrame: (i % (FPS * 2) === 0) });
         frame.close();
@@ -2776,10 +2776,11 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
           }
         }
       }
-      // 补完剩余的 AAC 帧直到 duration（秒）
-      while (aacNextSec < duration){
-        muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextSec, AAC_FRAME_SEC);
-        aacNextSec += AAC_FRAME_SEC;
+      // 补完剩余的 AAC 帧直到 duration（微秒）
+      var endUs = Math.round(duration * 1e6);
+      while (aacNextUs < endUs){
+        muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextUs, AAC_FRAME_US);
+        aacNextUs += AAC_FRAME_US;
       }
 
       els.pct.textContent = '100%';
@@ -2814,7 +2815,9 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
         });
         els.video.addEventListener('error', function onErr(){
           els.video.removeEventListener('error', onErr);
-          if (!done){ done = true; clearTimeout(timer); reject(new Error('视频解码失败')); }
+          var code = (els.video.error && els.video.error.code) || 0;
+          var msg = (els.video.error && els.video.error.message) || '';
+          if (!done){ done = true; clearTimeout(timer); reject(new Error('视频解码失败（错误码 ' + code + (msg ? ' · ' + msg : '') + '）')); }
         }, { once: true });
       });
 
