@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>PiP 测试 · 带 AAC 静音轨的视频能否进画中画</title>
+<style>
+  body{background:#111;color:#eee;font-family:-apple-system,"PingFang SC",sans-serif;margin:0;padding:40px 20px}
+  h1{font-size:20px;margin-bottom:8px}
+  p{color:#999;font-size:14px;line-height:1.7}
+  video{max-width:100%;border-radius:8px;background:#000}
+  button{display:block;margin-top:20px;padding:14px 28px;background:#FFB545;color:#111;border:0;border-radius:10px;font-size:16px;font-weight:600}
+  #log{margin-top:20px;background:#222;padding:12px 16px;border-radius:8px;font-family:ui-monospace,monospace;font-size:12px;color:#bbb;white-space:pre-wrap}
+  #log b{color:#6BDD9F}
+  #log .e{color:#FF7575}
+</style>
+</head>
+<body>
+  <h1>PiP 能不能起？</h1>
+  <p>这个页面用 ffmpeg 直接生成的"黄金标准" mp4 测 PiP。<br>
+  如果在你 iPhone 上这个视频也进不了画中画，说明 iOS Safari PiP 还有我们没意识到的硬限制。</p>
+
+  <video id="v" playsinline webkit-playsinline preload="auto" controls src="ref-silent.mp4"></video>
+  <button id="btn">开启画中画</button>
+  <div id="log">点击上面按钮后，这里会输出每一步的状态。<br></div>
+
+<script>
+const v = document.getElementById('v');
+const btn = document.getElementById('btn');
+const logEl = document.getElementById('log');
+function log(msg, ok){
+  const cls = ok===true?'<b>' : ok===false?'<span class="e">' : '';
+  const end = cls?'</span>':'';
+  logEl.innerHTML += cls + new Date().toLocaleTimeString() + ' ' + msg + end + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+log('Page loaded, video readyState=' + v.readyState + ' networkState=' + v.networkState);
+
+// 特性检测
+const hasPIP = 'requestPictureInPicture' in v;
+const hasWebKitPIP = 'webkitSetPresentationMode' in v;
+log('requestPictureInPicture support: ' + hasPIP, hasPIP);
+log('webkitSetPresentationMode support: ' + hasWebKitPIP, hasWebKitPIP);
+log('document.pictureInPictureElement: ' + (document.pictureInPictureElement ? 'yes' : 'null'));
+
+btn.onclick = async function(){
+  log('▶ 用户点击按钮');
+  try {
+    v.currentTime = 0;
+    v.muted = false;   // iOS PiP 不接受 muted 视频
+    v.play().then(()=> log('▶ video.play() OK', true)).catch(e=> log('▶ video.play() FAIL: '+e, false));
+  } catch(e){ log('▶ 前置步骤抛错: '+e, false); }
+
+  if (hasPIP) {
+    log('▶ 调用 video.requestPictureInPicture()...');
+    try {
+      const pipWin = await v.requestPictureInPicture();
+      log('▶ requestPictureInPicture 成功！窗口尺寸 ' + pipWin.width + 'x' + pipWin.height, true);
+    } catch(e) {
+      log('▶ requestPictureInPicture 抛错: ' + e.name + ': ' + e.message, false);
+    }
+  } else if (hasWebKitPIP) {
+    log('▶ 降级用 webkitSetPresentationMode("picture-in-picture")');
+    try {
+      v.webkitSetPresentationMode('picture-in-picture');
+      log('▶ 调用成功（webkit），等系统响应...');
+    } catch(e) {
+      log('▶ webkit 抛错: '+e, false);
+    }
+  } else {
+    log('▶ 当前设备不支持画中画 API', false);
+  }
+};
+
+v.addEventListener('enterpictureinpicture', ()=>log('🟢 事件 enterpictureinpicture 触发！', true));
+v.addEventListener('leavepictureinpicture', ()=>log('🔴 事件 leavepictureinpicture 触发'));
+v.addEventListener('error', ()=>log('❌ video.error=' + JSON.stringify(v.error), false));
+v.addEventListener('loadedmetadata', ()=>log('📼 metadata loaded: ' + v.videoWidth + 'x' + v.videoHeight + ' duration=' + v.duration + 's'));
+v.addEventListener('play', ()=>log('▶ play 事件'));
+v.addEventListener('pause', ()=>log('⏸ pause 事件'));
+</script>
+</body>
+</html>
+
+ls -la /workspace/pip-test.html /workspace/ref-silent.mp4
+echo "---"
+# 启动 HTTP server 让 Pages 可以引用
+cd /workspace && python3 -m http.server 8090 > /tmp/http.log 2>&1 &
+sleep 1
+curl -sS -o /dev/null -w "pip-test.html: HTTP %{http_code}\nref-silent.mp4: HTTP %{http_code}\n" http://127.0.0.1:8090/pip-test.html http://127.0.0.1:8090/ref-silent.mp4
+__tr_native_ec=$?; pwd -P >| '/var/log/tool/command-execution/fb3c12b81c715ca865fbbe8f94aed003/cwd.txt'; exit "$__tr_native_ec"
