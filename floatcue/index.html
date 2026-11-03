@@ -281,7 +281,7 @@ input[type=range]:disabled{opacity:.45}
     <div class="monitor-head"><span>FLOATING WINDOW</span><span>960 × 384 · 24FPS</span></div>
     <div class="screen" id="screen">
       <canvas id="previewCanvas" width="960" height="384" aria-label="提词预览"></canvas>
-      <video id="pipVideo" playsinline webkit-playsinline muted preload="metadata" controls></video>
+      <video id="pipVideo" playsinline webkit-playsinline preload="metadata" controls></video>
       <span class="corner tl"></span><span class="corner tr"></span>
       <span class="corner bl"></span><span class="corner br"></span>
       <button class="preview-btn" id="previewBtn" aria-label="试读">
@@ -353,7 +353,7 @@ input[type=range]:disabled{opacity:.45}
     <ol class="steps">
       <li class="step">
         <span class="no">01</span>
-        <div><h3 id="guideStep1">小窗已经浮起来了</h3><p id="guideStep1Text">提词会以画中画小窗出现，并且停在第 0 秒，不会提前滚走。</p></div>
+        <div><h3 id="guideStep1">小窗已经浮起来了</h3><p id="guideStep1Text">提词正在滚动，直接切到原相机即可。</p></div>
       </li>
       <li class="step">
         <span class="no">02</span>
@@ -2488,7 +2488,7 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       els.ctaSub.textContent = 'iOS 会自动浮起小窗';
     } else if (state.ready){
       els.ctaLabel.textContent = '开始画中画悬浮';
-      els.ctaSub.textContent = '停在第 0 秒 · 点播放';
+      els.ctaSub.textContent = '提词自动滚动 · 切相机即可';
     } else {
       els.ctaLabel.textContent = '生成悬浮提词';
       updateReadout();
@@ -2592,17 +2592,14 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
     els.guide.classList.add('open');
     els.guide.setAttribute('aria-hidden', 'false');
     document.body.classList.add('locked');
-    var note = $('guideNote');
     var step1 = $('guideStep1');
     var step1Text = $('guideStep1Text');
     if (fallbackMode){
       step1.textContent = '先播放，再切到相机';
       step1Text.textContent = '点下面的按钮让视频播放，然后立刻切到相机，系统会自动浮起小窗。';
-      note.innerHTML = '<b>画中画没有自动打开？</b> 先点下面的按钮播放视频，再立刻上滑切到相机——iOS 会自动把正在播放的画面浮到原相机上方。';
     } else {
       step1.textContent = '小窗已经浮起来了';
-      step1Text.textContent = '提词会以画中画小窗出现，并且停在第 0 秒，不会提前滚走。';
-      note.innerHTML = '<b>小窗没有出现？</b> 先让视频播放，再上滑切到相机，iOS 会自动把画面浮起来。画中画窗口本身是深色底，不是真透明，这是系统限制。';
+      step1Text.textContent = '提词正在滚动，直接切到原相机即可。如果需要暂停/调速，小窗上有播放控制条。';
     }
   }
   function closeGuide(){
@@ -2623,28 +2620,26 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
     var supports = ('requestPictureInPicture' in v) || ('webkitSetPresentationMode' in v);
     if (!supports){ fallbackAutoPip(); return; }
 
+    // iOS Safari PiP 强制拒绝 muted 视频，也拒绝纯视频（无音频轨）的 mp4
     try { v.currentTime = 0; } catch(e){}
-    try { v.muted = true; v.play().catch(function(){}); } catch(e){}
+    try { v.muted = false; } catch(e){}
+    try { v.play().catch(function(){}); } catch(e){}
+
+    var autoPlayInPip = function(){
+      state.pipActive = true;
+      // 不再 pause：让提词从 0 秒自动滚，用户切相机时小窗继续显示滚动画面
+      try { v.muted = false; v.play().catch(function(){}); } catch(e){}
+      state.fallback = false;
+      refreshCTA();
+      openGuide(false);
+    };
 
     try {
       if ('requestPictureInPicture' in v){
-        v.requestPictureInPicture().then(function(){
-          state.pipActive = true;
-          pauseAndRewind();
-          state.fallback = false;
-          refreshCTA();
-          openGuide(false);
-        }).catch(function(){
-          fallbackAutoPip();
-        });
+        v.requestPictureInPicture().then(autoPlayInPip).catch(function(){ fallbackAutoPip(); });
       } else {
         v.webkitSetPresentationMode('picture-in-picture');
-        setTimeout(function(){
-          state.pipActive = true;
-          pauseAndRewind();
-          refreshCTA();
-          openGuide(false);
-        }, 350);
+        setTimeout(autoPlayInPip, 350);
       }
     } catch(e){
       fallbackAutoPip();
@@ -2722,8 +2717,15 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       var muxer = new Mp4Muxer.Muxer({
         target: target,
         video: { codec: 'avc', width: W, height: H, frameRate: FPS },
+        audio: { codec: 'aac', numberOfChannels: 1, sampleRate: 48000 },
         fastStart: 'in-memory'
       });
+
+      // 48kHz mono AAC-LC 静音帧：每帧 1024 samples = 21.333ms = 21333us
+      // （iOS Safari PiP 强制要求视频含音频轨道，静音帧即可）
+      var AAC_SILENCE_FRAME = new Uint8Array([0x01, 0x18, 0x20, 0x07]);
+      var AAC_FRAME_US = Math.round(1024 / 48000 * 1e6); // 21333
+      var aacNextTs = 0;
 
       var encodeError = null;
       encoder = new VideoEncoder({
@@ -2740,10 +2742,16 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       for (var i = 0; i < totalFrames; i++){
         if (encodeError) throw encodeError;
         var t = i / FPS;
+        var tUs = Math.round(t * 1e6);
+        // 交错塞静音 AAC 帧，保证音视频 timestamp 单调递增
+        while (aacNextTs < tUs){
+          muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextTs, AAC_FRAME_US);
+          aacNextTs += AAC_FRAME_US;
+        }
         drawAt(t < HOLD ? 0 : Math.min(span, (t - HOLD) * state.speed));
 
         var frame = new VideoFrame(els.canvas, {
-          timestamp: Math.round(t * 1e6),
+          timestamp: tUs,
           duration: frameDur
         });
         encoder.encode(frame, { keyFrame: (i % (FPS * 2) === 0) });
@@ -2760,6 +2768,12 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
             }
           }
         }
+      }
+      // 补完剩余的 AAC 帧直到 duration
+      var endUs = Math.round(duration * 1e6);
+      while (aacNextTs < endUs){
+        muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextTs, AAC_FRAME_US);
+        aacNextTs += AAC_FRAME_US;
       }
 
       els.pct.textContent = '100%';
@@ -2800,7 +2814,7 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
 
       state.ready = true;
       els.screen.classList.add('is-ready');
-      setStatus('已生成 · 停在第 0 秒');
+      setStatus('已生成 · 点下方按钮开启画中画');
       els.duration.textContent = fmtTime(duration);
       refreshCTA();
       toast('悬浮提词已就绪，点下方按钮开启画中画');
@@ -2919,7 +2933,8 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
 
   els.video.addEventListener('enterpictureinpicture', function(){
     state.pipActive = true;
-    if (!state.fallback) pauseAndRewind();
+    // 不要 pause：PiP 里保持视频滚动，用户切到相机就能看到提词
+    try { els.video.muted = false; els.video.play().catch(function(){}); } catch(e){}
     refreshCTA();
   });
 
