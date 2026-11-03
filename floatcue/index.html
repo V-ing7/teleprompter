@@ -2739,6 +2739,7 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       // 两条路都统一成 AVCC + 自建 avcC，否则 Safari 生成的 mp4 没有 SPS/PPS，iOS 直接拒绝播放。
       var avcCdesc = null;
       var spsNal = null;
+      var codecMode = null;   // 'avcc' | 'annexb'：只在第一帧判定一次
 
       function splitAnnexB(bytes){
         var nals = [], i = 0, n = bytes.length;
@@ -2800,29 +2801,37 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
             var bytes = new Uint8Array(chunk.byteLength);
             chunk.copyTo(bytes);
 
-            // 判据用「有没有 decoderConfig.description」而不是猜 start code：
-            // AVCC 的首个 4 字节是 NAL 长度，小长度(如 0x000001xx)会冒充 start code 造成误判。
-            var hasDesc = !!(meta && meta.decoderConfig && meta.decoderConfig.description);
-            var payload;
+            // 格式只在第一帧判定一次：Chrome 只在首帧 meta 里带 description，
+            // 之后每帧都没有；若逐帧判断会把 AVCC 当成 Annex B，切出空 payload。
+            if (codecMode === null){
+              if (meta && meta.decoderConfig && meta.decoderConfig.description){
+                codecMode = 'avcc';
+                var d0 = meta.decoderConfig.description;
+                avcCdesc = d0 instanceof Uint8Array ? d0 : new Uint8Array(d0);
+              } else {
+                codecMode = 'annexb';
+              }
+            }
 
-            if (!hasDesc){
-              // Safari：Annex B 码流，没有 description，SPS/PPS 随关键帧带在码流里
+            var payload;
+            // 4 字节长度前缀为 1 的 AVCC 帧不可能出现，所以 `00 00 00 01` 只可能是 start code
+            var looksAnnexB = bytes.length >= 4 && bytes[0]===0 && bytes[1]===0 && bytes[2]===0 && bytes[3]===1;
+
+            if (codecMode === 'annexb' || looksAnnexB){
+              // Safari：Annex B 码流，SPS/PPS 随关键帧带在码流里
               var nals = splitAnnexB(bytes), k;
               for (k = 0; k < nals.length; k++){
                 if (!spsNal && nals[k].type === 7) spsNal = nals[k].data;
                 if (!avcCdesc && spsNal && nals[k].type === 8) avcCdesc = buildAvcC(spsNal, nals[k].data);
               }
-              payload = nalsToAVCC(nals);
+              payload = nals.length ? nalsToAVCC(nals) : bytes;
             } else {
               // Chrome：AVCC 码流 + 官方 avcC 描述
               payload = bytes;
-              if (!avcCdesc){
-                var d = meta.decoderConfig.description;
-                avcCdesc = d instanceof Uint8Array ? d : new Uint8Array(d);
-              }
             }
 
             if (!avcCdesc) throw new Error('编码器未提供 SPS/PPS，无法封装视频');
+            if (payload.length === 0) throw new Error('编码器输出的视频帧为空');
 
             muxer.addVideoChunkRaw(payload, chunk.type, outIndex * vFrameUs, vFrameUs, {
               decoderConfig: { description: avcCdesc, codedWidth: W, codedHeight: H }
