@@ -2730,14 +2730,100 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       var aacNextUs = 0;
 
       var encodeError = null;
-      // 用自维护帧序号出时间戳（微秒）：WebCodecs 首帧会带 -0.04us 级浮点偏移，
-      // 直接透传 chunk.timestamp 会触发 muxer 的 "first chunk must be 0" 校验。
       var outIndex = 0;
       var vFrameUs = Math.round(1e6 / FPS);
+
+      // ---- H.264 码流归一化 ----
+      // Chrome 的 VideoEncoder 输出 AVCC(4 字节长度前缀) 并在 meta 里带 avcC 描述；
+      // Safari 输出 Annex B(start code 分隔) 且【不提供】decoderConfig.description。
+      // 两条路都统一成 AVCC + 自建 avcC，否则 Safari 生成的 mp4 没有 SPS/PPS，iOS 直接拒绝播放。
+      var avcCdesc = null;
+      var spsNal = null;
+
+      function splitAnnexB(bytes){
+        var nals = [], i = 0, n = bytes.length;
+        while (i + 3 <= n){
+          var sc = 0;
+          if (bytes[i]===0 && bytes[i+1]===0 && bytes[i+2]===0 && bytes[i+3]===1) sc = 4;
+          else if (bytes[i]===0 && bytes[i+1]===0 && bytes[i+2]===1) sc = 3;
+          if (!sc){ i++; continue; }
+          var start = i + sc, j = start + 1, end = n;
+          while (j + 3 <= n){
+            if ((bytes[j]===0 && bytes[j+1]===0 && bytes[j+2]===0 && bytes[j+3]===1) ||
+                (bytes[j]===0 && bytes[j+1]===0 && bytes[j+2]===1)){ end = j; break; }
+            j++;
+          }
+          nals.push({ type: bytes[start] & 0x1f, data: bytes.subarray(start, end) });
+          i = end;
+        }
+        return nals;
+      }
+
+      function nalsToAVCC(nals){
+        var total = 0, k;
+        for (k = 0; k < nals.length; k++) total += 4 + nals[k].data.length;
+        var out = new Uint8Array(total), o = 0;
+        for (k = 0; k < nals.length; k++){
+          var len = nals[k].data.length;
+          out[o] = (len >>> 24) & 0xff;
+          out[o+1] = (len >>> 16) & 0xff;
+          out[o+2] = (len >>> 8) & 0xff;
+          out[o+3] = len & 0xff;
+          out.set(nals[k].data, o + 4);
+          o += 4 + len;
+        }
+        return out;
+      }
+
+      function buildAvcC(sps, pps){
+        var out = new Uint8Array(6 + 2 + sps.length + 1 + 2 + pps.length);
+        out[0] = 1;          // configurationVersion
+        out[1] = sps[1];     // AVCProfileIndication
+        out[2] = sps[2];     // profile_compatibility
+        out[3] = sps[3];     // AVCLevelIndication
+        out[4] = 0xff;       // lengthSizeMinusOne = 3 → 4 字节长度前缀
+        out[5] = 0xe1;       // numOfSequenceParameterSets = 1
+        var o = 6;
+        out[o++] = (sps.length >> 8) & 0xff;
+        out[o++] = sps.length & 0xff;
+        out.set(sps, o); o += sps.length;
+        out[o++] = 1;        // numOfPictureParameterSets —— 漏了这个字节 iOS 会报 PPS 缺失
+        out[o++] = (pps.length >> 8) & 0xff;
+        out[o++] = pps.length & 0xff;
+        out.set(pps, o);
+        return out;
+      }
+
       encoder = new VideoEncoder({
         output: function(chunk, meta){
           try {
-            muxer.addVideoChunk(chunk, meta, outIndex * vFrameUs);
+            var bytes = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(bytes);
+
+            var isAnnexB = bytes.length >= 4 && bytes[0] === 0 && bytes[1] === 0 &&
+                           (bytes[2] === 1 || (bytes[2] === 0 && bytes[3] === 1));
+            var payload;
+
+            if (isAnnexB){
+              var nals = splitAnnexB(bytes), k;
+              for (k = 0; k < nals.length; k++){
+                if (!spsNal && nals[k].type === 7) spsNal = nals[k].data;
+                if (!avcCdesc && spsNal && nals[k].type === 8) avcCdesc = buildAvcC(spsNal, nals[k].data);
+              }
+              payload = nalsToAVCC(nals);
+            } else {
+              payload = bytes;
+              if (!avcCdesc && meta && meta.decoderConfig && meta.decoderConfig.description){
+                var d = meta.decoderConfig.description;
+                avcCdesc = d instanceof Uint8Array ? d : new Uint8Array(d);
+              }
+            }
+
+            if (!avcCdesc) throw new Error('编码器未提供 SPS/PPS，无法封装视频');
+
+            muxer.addVideoChunkRaw(payload, chunk.type, outIndex * vFrameUs, vFrameUs, {
+              decoderConfig: { description: avcCdesc, codedWidth: W, codedHeight: H }
+            });
             outIndex++;
           } catch(e){ encodeError = encodeError || e; }
         },
