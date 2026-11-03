@@ -2718,7 +2718,8 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
         target: target,
         video: { codec: 'avc', width: W, height: H, frameRate: FPS },
         audio: { codec: 'aac', numberOfChannels: 1, sampleRate: 48000 },
-        fastStart: 'in-memory'
+        fastStart: 'in-memory',
+        firstTimestampBehavior: 'offset'
       });
 
       // 48kHz mono AAC-LC 静音帧：每帧 1024 samples = 21.333ms
@@ -2728,13 +2729,15 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
       var aacNextSec = 0;
 
       var encodeError = null;
+      // 用自己维护的帧序号出时间戳：WebCodecs 会给首帧加微小舍入偏移（如 -4e-8s），
+      // 直接透传 chunk.timestamp 会让 muxer 报 "first chunk must have timestamp of 0"。
+      var outIndex = 0;
+      var vFrameSec = 1 / FPS;
       encoder = new VideoEncoder({
         output: function(chunk, meta){
           try {
-            // WebCodecs chunk.timestamp / chunk.duration 是微秒，muxer 期望秒
-            muxer.addVideoChunk(chunk, meta,
-              chunk.timestamp / 1e6,
-              chunk.duration / 1e6);
+            muxer.addVideoChunk(chunk, meta, outIndex * vFrameSec, vFrameSec);
+            outIndex++;
           } catch(e){ encodeError = encodeError || e; }
         },
         error: function(e){ encodeError = encodeError || e; }
