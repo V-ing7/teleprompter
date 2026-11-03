@@ -2800,11 +2800,13 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
             var bytes = new Uint8Array(chunk.byteLength);
             chunk.copyTo(bytes);
 
-            var isAnnexB = bytes.length >= 4 && bytes[0] === 0 && bytes[1] === 0 &&
-                           (bytes[2] === 1 || (bytes[2] === 0 && bytes[3] === 1));
+            // 判据用「有没有 decoderConfig.description」而不是猜 start code：
+            // AVCC 的首个 4 字节是 NAL 长度，小长度(如 0x000001xx)会冒充 start code 造成误判。
+            var hasDesc = !!(meta && meta.decoderConfig && meta.decoderConfig.description);
             var payload;
 
-            if (isAnnexB){
+            if (!hasDesc){
+              // Safari：Annex B 码流，没有 description，SPS/PPS 随关键帧带在码流里
               var nals = splitAnnexB(bytes), k;
               for (k = 0; k < nals.length; k++){
                 if (!spsNal && nals[k].type === 7) spsNal = nals[k].data;
@@ -2812,8 +2814,9 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
               }
               payload = nalsToAVCC(nals);
             } else {
+              // Chrome：AVCC 码流 + 官方 avcC 描述
               payload = bytes;
-              if (!avcCdesc && meta && meta.decoderConfig && meta.decoderConfig.description){
+              if (!avcCdesc){
                 var d = meta.decoderConfig.description;
                 avcCdesc = d instanceof Uint8Array ? d : new Uint8Array(d);
               }
