@@ -2721,38 +2721,42 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
         fastStart: 'in-memory'
       });
 
-      // 48kHz mono AAC-LC 静音帧：每帧 1024 samples = 21.333ms = 21333us
+      // 48kHz mono AAC-LC 静音帧：每帧 1024 samples = 21.333ms
       // （iOS Safari PiP 强制要求视频含音频轨道，静音帧即可）
       var AAC_SILENCE_FRAME = new Uint8Array([0x01, 0x18, 0x20, 0x07]);
-      var AAC_FRAME_US = Math.round(1024 / 48000 * 1e6); // 21333
-      var aacNextTs = 0;
+      var AAC_FRAME_SEC = 1024 / 48000; // 0.0213333s — muxer 期望秒
+      var aacNextSec = 0;
 
       var encodeError = null;
       encoder = new VideoEncoder({
         output: function(chunk, meta){
-          try { muxer.addVideoChunk(chunk, meta); }
-          catch(e){ encodeError = encodeError || e; }
+          try {
+            // WebCodecs chunk.timestamp / chunk.duration 是微秒，muxer 期望秒
+            muxer.addVideoChunk(chunk, meta,
+              chunk.timestamp / 1e6,
+              chunk.duration / 1e6);
+          } catch(e){ encodeError = encodeError || e; }
         },
         error: function(e){ encodeError = encodeError || e; }
       });
       encoder.configure(config);
 
       var span = scrollSpan();
-      var frameDur = Math.round(1e6 / FPS);
       for (var i = 0; i < totalFrames; i++){
         if (encodeError) throw encodeError;
-        var t = i / FPS;
-        var tUs = Math.round(t * 1e6);
-        // 交错塞静音 AAC 帧，保证音视频 timestamp 单调递增
-        while (aacNextTs < tUs){
-          muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextTs, AAC_FRAME_US);
-          aacNextTs += AAC_FRAME_US;
+        var tSec = i / FPS;
+        var tUs = Math.round(tSec * 1e6);
+        // 交错塞静音 AAC 帧，时间戳用秒（muxer 期望）
+        while (aacNextSec < tSec){
+          muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextSec, AAC_FRAME_SEC);
+          aacNextSec += AAC_FRAME_SEC;
         }
-        drawAt(t < HOLD ? 0 : Math.min(span, (t - HOLD) * state.speed));
+        drawAt(tSec < HOLD ? 0 : Math.min(span, (tSec - HOLD) * state.speed));
 
+        var frameDurUs = Math.round(1e6 / FPS);
         var frame = new VideoFrame(els.canvas, {
           timestamp: tUs,
-          duration: frameDur
+          duration: frameDurUs
         });
         encoder.encode(frame, { keyFrame: (i % (FPS * 2) === 0) });
         frame.close();
@@ -2769,11 +2773,10 @@ if (typeof module === "object" && typeof module.exports === "object") Object.ass
           }
         }
       }
-      // 补完剩余的 AAC 帧直到 duration
-      var endUs = Math.round(duration * 1e6);
-      while (aacNextTs < endUs){
-        muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextTs, AAC_FRAME_US);
-        aacNextTs += AAC_FRAME_US;
+      // 补完剩余的 AAC 帧直到 duration（秒）
+      while (aacNextSec < duration){
+        muxer.addAudioChunkRaw(AAC_SILENCE_FRAME, 'key', aacNextSec, AAC_FRAME_SEC);
+        aacNextSec += AAC_FRAME_SEC;
       }
 
       els.pct.textContent = '100%';
